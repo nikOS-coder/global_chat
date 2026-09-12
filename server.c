@@ -1,3 +1,5 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,11 +9,19 @@
 #include <pthread.h>
 #include <mongoc/mongoc.h>
 #include <bson/bson.h>
+#include <signal.h>
+#include <errno.h>
 
 #define BUFFER_SIZE 4096
 #define USERNAME_SIZE 20
 #define PASSWORD_SIZE 50
 #define MAX_CLIENTS 10
+
+volatile sig_atomic_t keep_running = 1;
+
+void handle_sigint(int sig) {
+    keep_running = 0;
+}
 
 typedef struct{
     int socket;
@@ -25,6 +35,7 @@ char* mongo_check_password(mongoc_collection_t*, char*);
 bool insert_credentials(mongoc_collection_t*, const bson_t*);
 bool sign_up(client_data*);
 bool login(client_data*);
+void remove_client(int);
 
 int count = 0;
 int client_sockets[MAX_CLIENTS];
@@ -50,6 +61,7 @@ void* client_thread(void* args) {
         fprintf(stdout, "Authentication failed for client. Closing connection.\n");
         close(cd->socket);
         free(cd);
+        remove_client(cd->socket);
         return NULL; 
     }
 
@@ -62,35 +74,43 @@ void* client_thread(void* args) {
         if(received_bytes == -1) {
             perror("Failed to receive message!");
             close(cd->socket);
+            free(buffer);
+            free(cd);   
+            remove_client(cd->socket);         
             return NULL;
         }
         else if(received_bytes == 0) {
             perror("0 bytes were sent, closing ...");
             close(cd->socket);
+            free(buffer);
+            free(cd);
+            remove_client(cd->socket);
             return NULL;
         }
         buffer[strcspn(buffer, "\n")] = '\0'; 
         fprintf(stdout, "\r\033[2K[%s] -> %s (bytes %zd)\n", cd->username, buffer, received_bytes);
 
-        pthread_mutex_lock(&clients_mutex);
-        for(int i = 0; i < count; i++) {
-            if(client_sockets[i] != cd->socket) {
-                if(send(client_sockets[i], buffer, strlen(buffer), 0) == -1) {
-                    fprintf(stdout, "%d customer didnt receive message", i);
-                    close(cd->socket);
-                    return NULL;
-                }
+    pthread_mutex_lock(&clients_mutex);
+    for(int i = 0; i < count; i++) {
+        if(client_sockets[i] != cd->socket) {
+            if(send(client_sockets[i], buffer, strlen(buffer), 0) == -1) {
+                close(client_sockets[i]);
+                client_sockets[i] = client_sockets[count - 1];
+                count--;
+                i--;
+                continue;
+            }
 
-                usleep(100000);
-
-                if(send(client_sockets[i], cd->username, strlen(cd->username), 0) == -1) {
-                    fprintf(stdout, "%d customer didnt receive message", i);
-                    close(cd->socket);
-                    return NULL;
-                }
+            if(send(client_sockets[i], cd->username, strlen(cd->username), 0) == -1) {
+                close(client_sockets[i]);
+                client_sockets[i] = client_sockets[count - 1];
+                count--;
+                i--;
+                continue;
             }
         }
-        pthread_mutex_unlock(&clients_mutex);
+    }
+    pthread_mutex_unlock(&clients_mutex);
     }
 
     return NULL;
@@ -99,9 +119,21 @@ void* client_thread(void* args) {
 int main(int argc, char* argv[]) {
     if(argc != 2) {
         fprintf(stdout, "usage -> <./executable> <PORT number>\n");
+        exit(EXIT_FAILURE);
     }
 
-    client_data *cd = (client_data*)malloc(sizeof(client_data));
+    signal(SIGPIPE, SIG_IGN);
+
+    struct sigaction sa;
+
+    sa.sa_handler = handle_sigint;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+
+    if (sigaction(SIGINT, &sa, NULL) < 0) {
+        perror("sigaction");
+        exit(EXIT_FAILURE);
+    }
 
     //mongo
     mongoc_init();
@@ -111,7 +143,6 @@ int main(int argc, char* argv[]) {
     }
 
     mongoc_collection_t *collection = mongoc_client_get_collection(client, "global_chat", "users");
-    cd->collection = collection;
     fprintf(stdout, "Succesfully connected to collection users\n");
 
     //socket
@@ -137,17 +168,19 @@ int main(int argc, char* argv[]) {
     }
 
     int clientfd;
-    while(1) {
+    while(keep_running) {
         clientfd = accept(serverfd, (struct sockaddr*)&address, (socklen_t*)&addrsize);
         if(clientfd == -1) {
+            if(errno == EINTR) {
+                break;
+            }
             perror("Failed to accept the client!");
-            close(serverfd);
-            close(clientfd);
+            continue;
         }
         pthread_mutex_lock(&clients_mutex);
         if(count < MAX_CLIENTS) {
             pthread_t client_handler;
-            cd = (client_data*)malloc(sizeof(client_data));
+            client_data *cd = (client_data*)malloc(sizeof(client_data));
             cd->socket = clientfd;
             cd->collection = collection;
 
@@ -164,13 +197,17 @@ int main(int argc, char* argv[]) {
         pthread_mutex_unlock(&clients_mutex);
     }
 
-    mongoc_collection_destroy(cd->collection);
+    mongoc_collection_destroy(collection);
     mongoc_client_destroy(client);
     mongoc_cleanup();
+   
+    pthread_mutex_lock(&clients_mutex);
+    for(int i = 0; i < count; i++) {
+        close(client_sockets[i]);
+    }
+    pthread_mutex_unlock(&clients_mutex);
 
-    free(cd);
     close(serverfd);
-    close(clientfd);
     return 0;
 }
 
@@ -316,8 +353,11 @@ bool login(client_data *cd) {
     
     int count = 0;
     char *password = (char*)malloc(PASSWORD_SIZE * sizeof(char));
-    char *str = (char*)malloc(PASSWORD_SIZE * sizeof(char));
-    strcpy(str, mongo_check_password(cd->collection, username));
+    char *str = mongo_check_password(cd->collection, username);
+    if (!str) {
+        free(password);
+        return false;
+    }
     do {
         char *msg3 = "Type your password\n";
         if(send(cd->socket, msg3, strlen(msg3), 0) == -1) {
@@ -358,4 +398,16 @@ bool login(client_data *cd) {
     fprintf(stdout, "Client %s has logged in\n", cd->username);
 
     return true;
+}
+
+void remove_client(int socket) {
+    pthread_mutex_lock(&clients_mutex);
+    for(int i = 0; i < count; i++) {
+        if(client_sockets[i] == socket) {
+            client_sockets[i] = client_sockets[count - 1]; // Φέρνουμε τον τελευταίο στη θέση αυτού που έφυγε
+            count--;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&clients_mutex);
 }
