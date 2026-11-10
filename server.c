@@ -17,12 +17,14 @@
 #define PASSWORD_SIZE 50
 #define MAX_CLIENTS 10
 
+// Flag to control server running state for graceful shutdown
 volatile sig_atomic_t keep_running = 1;
 
 void handle_sigint(int sig) {
     keep_running = 0;
 }
 
+// Structure containing client connection details and database reference
 typedef struct{
     int socket;
     char username[USERNAME_SIZE];
@@ -41,10 +43,14 @@ int count = 0;
 int client_sockets[MAX_CLIENTS];
 pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* 
+ * Thread function to handle individual client requests,
+ * authentication, and message broadcasting.
+ */
 void* client_thread(void* args) {
     client_data *cd = (client_data*)args;
 
-    //setting up customer
+    // setting up customer choice (sign up or login)
     char choice[2] = {0};
     if(recv(cd->socket, choice, sizeof(choice), 0) == -1) {
         perror("Failed to receive choice!");
@@ -65,7 +71,7 @@ void* client_thread(void* args) {
         return NULL; 
     }
 
-    //serving the message to clients
+    // serving the message broadcast to connected clients
     char *buffer = (char*)malloc(sizeof(char) * BUFFER_SIZE);
     while(1) {
         memset(buffer, 0, BUFFER_SIZE * sizeof(char));
@@ -76,7 +82,7 @@ void* client_thread(void* args) {
             close(cd->socket);
             free(buffer);
             free(cd);   
-            remove_client(cd->socket);         
+            remove_client(cd->socket);        
             return NULL;
         }
         else if(received_bytes == 0) {
@@ -90,6 +96,7 @@ void* client_thread(void* args) {
         buffer[strcspn(buffer, "\n")] = '\0'; 
         fprintf(stdout, "\r\033[2K[%s] -> %s (bytes %zd)\n", cd->username, buffer, received_bytes);
 
+    // Thread-safe broadcasting to all other active clients
     pthread_mutex_lock(&clients_mutex);
     for(int i = 0; i < count; i++) {
         if(client_sockets[i] != cd->socket) {
@@ -122,6 +129,7 @@ int main(int argc, char* argv[]) {
         exit(EXIT_FAILURE);
     }
 
+    // Ignore broken pipe signals on socket disconnection
     signal(SIGPIPE, SIG_IGN);
 
     struct sigaction sa;
@@ -135,7 +143,7 @@ int main(int argc, char* argv[]) {
         exit(EXIT_FAILURE);
     }
 
-    //mongo
+    // Initialize MongoDB connection and collection handle
     mongoc_init();
     mongoc_client_t *client = mongoc_client_new("mongodb://localhost:27017");
     if(!client) {
@@ -145,7 +153,7 @@ int main(int argc, char* argv[]) {
     mongoc_collection_t *collection = mongoc_client_get_collection(client, "global_chat", "users");
     fprintf(stdout, "Succesfully connected to collection users\n");
 
-    //socket
+    // Setup TCP server socket
     int serverfd = socket(AF_INET, SOCK_STREAM, 0);
     if(serverfd == -1) {
         perror("Failed to create socket!");
@@ -167,6 +175,7 @@ int main(int argc, char* argv[]) {
         close(serverfd);
     }
 
+    // Accept incoming client connections in a loop
     int clientfd;
     while(keep_running) {
         clientfd = accept(serverfd, (struct sockaddr*)&address, (socklen_t*)&addrsize);
@@ -186,6 +195,7 @@ int main(int argc, char* argv[]) {
 
             client_sockets[count++] = clientfd;
 
+            // Create detached thread for the accepted client
             pthread_create(&client_handler, NULL, client_thread, cd);
 
             pthread_detach(client_handler);
@@ -197,6 +207,7 @@ int main(int argc, char* argv[]) {
         pthread_mutex_unlock(&clients_mutex);
     }
 
+    // Cleanup database and server resources
     mongoc_collection_destroy(collection);
     mongoc_client_destroy(client);
     mongoc_cleanup();
@@ -210,6 +221,8 @@ int main(int argc, char* argv[]) {
     close(serverfd);
     return 0;
 }
+
+// --- MongoDB Database Helper Functions ---
 
 const bson_t* mongo_search_username(mongoc_collection_t* collection, char *username) {
     bson_t *filter = BCON_NEW("username", BCON_UTF8(username));
@@ -366,7 +379,7 @@ bool login(client_data *cd) {
         }
 
         if(recv(cd->socket, password, sizeof(char) * PASSWORD_SIZE, 0) == -1) {
-            perror("Failed to receive password!");
+            perror("Failed-to receive password!");
             close(cd->socket);
             return false;
         }
@@ -404,7 +417,7 @@ void remove_client(int socket) {
     pthread_mutex_lock(&clients_mutex);
     for(int i = 0; i < count; i++) {
         if(client_sockets[i] == socket) {
-            client_sockets[i] = client_sockets[count - 1]; // Φέρνουμε τον τελευταίο στη θέση αυτού που έφυγε
+            client_sockets[i] = client_sockets[count - 1]; // Swap with last element
             count--;
             break;
         }
